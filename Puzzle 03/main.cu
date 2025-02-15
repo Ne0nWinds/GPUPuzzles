@@ -2,38 +2,33 @@
 
 #include <stdio.h>
 
-static random_state RandomState = { 0xB40148552A2E3491 };
 #define ARRAY_SIZE 4
 static u32 InitialArray[ARRAY_SIZE] = {0};
 static u32 ResultArray[ARRAY_SIZE] = {0};
 
-void InitRandomIntegers() {
+void Init() {
 	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
 		InitialArray[i] = i;
 	}
-	(void)RandomState;
 }
 
-__global__ void Guard(u32 *In, u32 *Out, u32 Length) {
+__global__ void Guard(u32 *GPUMemory, u32 Length) {
 	u32 Index = threadIdx.x;
 	if (Index < Length) {
-		Out[Index] = In[Index] + 10;
+		GPUMemory[Index] += 10;
 	}
 }
 
 s32 main() {
-	InitRandomIntegers();
+	Init();
 
-	u32 *GPUArray1 = 0, *GPUArray2 = 0;
-	cudaMalloc(&GPUArray1, ARRAY_SIZE * sizeof(int));
-	cudaMalloc(&GPUArray2, ARRAY_SIZE * sizeof(int));
-	cudaMemcpy(GPUArray1, InitialArray, ARRAY_SIZE * sizeof(int), cudaMemcpyHostToDevice);
-	cudaMemcpy(GPUArray2, InitialArray, ARRAY_SIZE * sizeof(int), cudaMemcpyHostToDevice);
+	u32 *GPUMemory = 0;
+	u32 SizeInBytes = ARRAY_SIZE * sizeof(s32);
+	cudaMalloc(&GPUMemory, SizeInBytes);
+	cudaMemcpy(GPUMemory, InitialArray, SizeInBytes, cudaMemcpyHostToDevice);
 
-	Guard<<<1, 8>>>(GPUArray1, GPUArray2, ARRAY_SIZE);
-	cudaMemcpy(ResultArray, GPUArray2, ARRAY_SIZE * sizeof(int), cudaMemcpyDeviceToHost);
-
-	puts("===");
+	Guard<<<1, 8>>>(GPUMemory, ARRAY_SIZE);
+	cudaMemcpy(ResultArray, GPUMemory, SizeInBytes, cudaMemcpyDeviceToHost);
 
 	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
 		u32 A = InitialArray[i];

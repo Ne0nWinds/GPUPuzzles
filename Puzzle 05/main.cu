@@ -2,53 +2,69 @@
 
 #include <stdio.h>
 
-static random_state RandomState = { 0xB40148552A2E3491 };
-#define ARRAY_SIZE 16
-static u32 InitialArrayHorizontal[ARRAY_SIZE] = {0};
-static u32 InitialArrayVertical[ARRAY_SIZE] = {0};
-static u32 ResultArray[ARRAY_SIZE] = {0};
+#define VECTOR_SIZE 4
+#define MATRIX_SIZE (VECTOR_SIZE * VECTOR_SIZE)
+static u32 ColumnVector[VECTOR_SIZE] = {0};
+static u32 RowVector[VECTOR_SIZE] = {0};
+static u32 ResultArray[MATRIX_SIZE] = {0};
 
-void InitRandomIntegers() {
-	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
-		InitialArrayHorizontal[i] = i;
-	}
-	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
-		InitialArrayVertical[i] = i;
+static void Init() {
+	random_state RandomState = { 0xB40148552A2E3491ULL };
+	for (u32 i = 0; i < VECTOR_SIZE; ++i) {
+		ColumnVector[i] = RandomInt(&RandomState) % 32;
+		RowVector[i] = RandomInt(&RandomState) % 32;
 	}
 }
 
-__global__ void Map2D(u32 *Horizontal, u32 *Vertical, u32 *Out, u32 Length) {
+#define USE_2D_GRID 0
+
+#if USE_2D_GRID
+__global__ void Map2D(u32 *Row, u32 *Column, u32 *OutMatrix) {
 	u32 X = threadIdx.x;
 	u32 Y = threadIdx.y;
 
-	u32 A = Horizontal[X];
-	u32 B = Vertical[Y];
-	Out[Y * 4 + X] = A + B;
+	u32 A = Row[X];
+	u32 B = Column[Y];
+	OutMatrix[Y * VECTOR_SIZE + X] = A + B;
 }
+#else
+__global__ void Map2D(u32 *Row, u32 *Column, u32 *OutMatrix) {
+	u32 X = threadIdx.x / 4;
+	u32 Y = threadIdx.x % 4;
+
+	u32 A = Row[X];
+	u32 B = Column[Y];
+	OutMatrix[Y * VECTOR_SIZE + X] = A + B;
+}
+#endif
 
 s32 main() {
-	InitRandomIntegers();
-	puts("===");
+	Init();
 
-	u32 *GPUArray1 = 0, *GPUArray2 = 0, *GPUArray3 = 0;
-	cudaMalloc(&GPUArray1, ARRAY_SIZE * sizeof(int));
-	cudaMalloc(&GPUArray2, ARRAY_SIZE * sizeof(int));
-	cudaMalloc(&GPUArray3, ARRAY_SIZE * sizeof(int));
-	cudaMemcpy(GPUArray1, InitialArrayVertical, ARRAY_SIZE * sizeof(int), cudaMemcpyHostToDevice);
-	cudaMemcpy(GPUArray2, InitialArrayHorizontal, ARRAY_SIZE * sizeof(int), cudaMemcpyHostToDevice);
+	u32 *GPUColumnVector = 0, *GPURowVector = 0, *GPUMatrix = 0;
+	s32 VectorSizeInBytes = VECTOR_SIZE * sizeof(s32);
+	s32 MatrixSizeInBytes = MATRIX_SIZE * sizeof(s32);
+	cudaMalloc(&GPUColumnVector, VectorSizeInBytes);
+	cudaMalloc(&GPURowVector, VectorSizeInBytes);
+	cudaMalloc(&GPUMatrix, MatrixSizeInBytes);
+	cudaMemcpy(GPUColumnVector, ColumnVector, VectorSizeInBytes, cudaMemcpyHostToDevice);
+	cudaMemcpy(GPURowVector, RowVector, VectorSizeInBytes, cudaMemcpyHostToDevice);
+	cudaMemset(GPUMatrix, 0, MatrixSizeInBytes);
 
-	dim3 threadDimension(4, 4);
-	dim3 blockDimension(1, 1);
-	Map2D<<<blockDimension, threadDimension>>>(GPUArray1, GPUArray2, GPUArray3, ARRAY_SIZE);
-	cudaMemcpy(ResultArray, GPUArray3, ARRAY_SIZE * sizeof(int), cudaMemcpyDeviceToHost);
+#if USE_2D_GRID
+	dim3 threadDimension(VECTOR_SIZE, VECTOR_SIZE);
+	Map2D<<<1, threadDimension>>>(GPURowVector, GPUColumnVector, GPUMatrix);
+#else
+	u32 ThreadCount = MATRIX_SIZE;
+	Map2D<<<1, ThreadCount>>>(GPURowVector, GPUColumnVector, GPUMatrix);
+#endif
+	cudaMemcpy(ResultArray, GPUMatrix, MatrixSizeInBytes, cudaMemcpyDeviceToHost);
 
-	puts("===");
-
-	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
+	for (u32 i = 0; i < MATRIX_SIZE; ++i) {
 		u32 X = i / 4;
 		u32 Y = i % 4;
-		u32 A = InitialArrayHorizontal[X];
-		u32 B = InitialArrayVertical[Y];
+		u32 A = RowVector[X];
+		u32 B = ColumnVector[Y];
 		u32 ExpectedResult = A + B;
 		u32 ActualResult = ResultArray[Y * 4 + X];
 		if (ExpectedResult == ActualResult) {
