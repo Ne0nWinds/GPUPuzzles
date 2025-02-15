@@ -2,45 +2,41 @@
 
 #include <stdio.h>
 
-static random_state RandomState = { 0xB40148552A2E3491 };
-#define ARRAY_SIZE 9
+#define BLOCKS 3
+#define THREADS_PER_BLOCK 4
+#define ARRAY_SIZE (BLOCKS * THREADS_PER_BLOCK * 2)
 static u32 InitialArray[ARRAY_SIZE] = {0};
-static u32 ResultArray[ARRAY_SIZE * 2] = {0};
+static u32 ResultArray[ARRAY_SIZE] = {0};
 
-void InitRandomIntegers() {
+void Init() {
+	random_state RandomState = { 0xB40148552A2E3491ULL };
 	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
-		InitialArray[i] = i;
+		InitialArray[i] = RandomInt(&RandomState) % 32;
 	}
 }
 
-__global__ void Blocks(u32 *In, u32 *Out, u32 Length) {
-	u32 Index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (Index < Length) {
-		Out[Index] = In[Index] + 10;
-	}
+__global__ void Blocks(u32 *A) {
+	u32 GlobalIndex = blockIdx.x * blockDim.x + threadIdx.x;
+	A[GlobalIndex * 2] += 10;
+	A[GlobalIndex * 2 + 1] += 10;
 }
 
 s32 main() {
-	InitRandomIntegers();
-	puts("===");
+	Init();
 
-	u32 *GPUArray1 = 0, *GPUArray2 = 0;
-	cudaMalloc(&GPUArray1, ARRAY_SIZE * sizeof(int));
-	cudaMalloc(&GPUArray2, ARRAY_SIZE * sizeof(int));
-	cudaMemcpy(GPUArray1, InitialArray, ARRAY_SIZE * sizeof(int), cudaMemcpyHostToDevice);
+	u32 *GPUArray = 0;
+	cudaMalloc(&GPUArray, ARRAY_SIZE * sizeof(u32));
+	cudaMemcpy(GPUArray, InitialArray, ARRAY_SIZE * sizeof(u32), cudaMemcpyHostToDevice);
 
-	dim3 threadDimension(3, 1);
-	dim3 blockDimension(4, 1);
-	Blocks<<<blockDimension, threadDimension>>>(GPUArray1, GPUArray2, ARRAY_SIZE);
-	cudaMemcpy(ResultArray, GPUArray2, ARRAY_SIZE * sizeof(int), cudaMemcpyDeviceToHost);
+	u32 BlockCount = BLOCKS;
+	u32 ThreadsPerBlock = THREADS_PER_BLOCK;
+	Blocks<<<BlockCount, ThreadsPerBlock>>>(GPUArray);
+	cudaMemcpy(ResultArray, GPUArray, ARRAY_SIZE * sizeof(u32), cudaMemcpyDeviceToHost);
 
-	puts("===");
-
-	u32 i = 0;
-	for (; i < ARRAY_SIZE; ++i) {
+	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
 		u32 A = InitialArray[i];
 		u32 ActualResult = ResultArray[i];
-		u32 ExpectedResult = 10 + i;
+		u32 ExpectedResult = 10 + A;
 		if (ExpectedResult == ActualResult) {
 			printf(ANSI_COLOR_GREEN "%.2u + 10 = %u\n" ANSI_COLOR_RESET, A, ActualResult);
 		} else {
