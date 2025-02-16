@@ -3,46 +3,39 @@
 
 #include <stdio.h>
 
-static random_state RandomState = { 0xB40148552A2E3491 };
-#define ARRAY_SIZE 8
+#define ARRAY_SIZE 1092
 static u32 InitialArray[ARRAY_SIZE] = {0};
-static u32 ResultArray[ARRAY_SIZE * 2] = {0};
+static u32 ResultArray[ARRAY_SIZE] = {0};
 
-void InitRandomIntegers() {
+void Init() {
 	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
 		InitialArray[i] = i;
 	}
 }
 
-__global__ void Blocks(u32 *In, u32 *Out, u32 Length) {
-	__shared__ u32 SharedArray[4];
-	u32 Index = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void Shared(u32 *A, u32 Length) {
+	__shared__ u32 SharedArray[8];
+
+	u32 GlobalIndex = blockIdx.x * 8 + threadIdx.x;
 	u32 LocalIndex = threadIdx.x;
 
-	if (Index < Length) {
-		SharedArray[LocalIndex] = In[Index];
-		__syncthreads();
+	if (GlobalIndex < Length) {
+		SharedArray[LocalIndex] = A[GlobalIndex];
+		u32 Result = SharedArray[LocalIndex] + 10;
+		A[GlobalIndex] = Result;
 	}
-
-	Out[Index] = SharedArray[LocalIndex] + 10;
 }
 
 s32 main() {
-	InitRandomIntegers();
-	puts("===");
+	Init();
 
-	u32 *GPUArray1 = 0, *GPUArray2 = 0;
-	cudaMalloc(&GPUArray1, ARRAY_SIZE * sizeof(s32));
-	cudaMalloc(&GPUArray2, sizeof(ResultArray));
-	cudaMemset(GPUArray2, 0, sizeof(ResultArray));
-	cudaMemcpy(GPUArray1, InitialArray, ARRAY_SIZE * sizeof(s32), cudaMemcpyHostToDevice);
+	u32 *GPUArray = 0;
+	u32 SizeInBytes = sizeof(ResultArray);
+	cudaMalloc(&GPUArray, SizeInBytes);
+	cudaMemcpy(GPUArray, InitialArray, SizeInBytes, cudaMemcpyHostToDevice);
 
-	dim3 threadDimension(4, 1);
-	dim3 blockDimension(2, 1);
-	Blocks<<<blockDimension, threadDimension>>>(GPUArray1, GPUArray2, ARRAY_SIZE);
-	cudaMemcpy(ResultArray, GPUArray2, sizeof(ResultArray), cudaMemcpyDeviceToHost);
-
-	puts("===");
+	Shared<<<(ARRAY_SIZE + 7) / 8, 8>>>(GPUArray, ARRAY_SIZE);
+	cudaMemcpy(ResultArray, GPUArray, SizeInBytes, cudaMemcpyDeviceToHost);
 
 	u32 i = 0;
 	for (; i < ARRAY_SIZE; ++i) {
@@ -53,12 +46,6 @@ s32 main() {
 			printf(ANSI_COLOR_GREEN "%.2u + 10 = %u\n", A, ActualResult);
 		} else {
 			printf(ANSI_COLOR_RED "%.2u + 10 = %u\n", A, ActualResult);
-		}
-	}
-	for (; i < ARRAY_SIZE * 2; ++i) {
-		if (ResultArray[i] != 0) {
-			printf(ANSI_COLOR_RED "Wrote past the end of the array at index: %u", i);
-			break;
 		}
 	}
 	printf(ANSI_COLOR_RESET);
