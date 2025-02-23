@@ -3,80 +3,135 @@
 
 #include <stdio.h>
 
-static random_state RandomState = { 0xB40148552A2E3491 };
-#define ARRAY_SIZE 16
-static f32 InitialArray1[32] = {0};
-static f32 InitialArray2[32] = {0};
-static f32 ResultArray[32] = {0};
+#define SIZE_A 128
+#define SIZE_B 32
+static f32 ArrayA[SIZE_A] = {0};
+static f32 ArrayB[SIZE_B] = {0};
+static f32 ResultArray[SIZE_A] = {0};
 
-static void InitRandomIntegers() {
-	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
-		InitialArray1[i] = i;
+static void Init() {
+	static random_state RandomState = { 0x2ED3368E4B108C0CULL };
+	for (u32 i = 0; i < SIZE_A; ++i) {
+		ArrayA[i] = RandomFloat(&RandomState);
 	}
-	for (u32 i = 0; i < 4; ++i) {
-		InitialArray2[i] = i;
+	for (u32 i = 0; i < SIZE_B; ++i) {
+		ArrayB[i] = RandomFloat(&RandomState);
 	}
 }
-
-__global__ void Dot(f32 *In1, f32 *In2, f32 *Out, u32 Length) {
-	u32 LocalIndex = threadIdx.x;
 
 #if 0
-	f32 Result = 0.0f;
-	for (u32 j = 0; j < ARRAY_LEN(InitialArray2); ++j) {
-		if (LocalIndex + j >= ARRAY_SIZE) break;
-		f32 A = In1[LocalIndex + j];
-		f32 B = In2[j];
-		Result = fma(A, B, Result);
-	}
-#else
+__global__ void Convolution(f32 *A, u32 LengthA, f32 *B, u32 LengthB, f32 *Out) {
 
 	f32 Result = 0.0f;
-	f32 InputA = In1[LocalIndex];
-	f32 InputB = In2[LocalIndex];
-	__syncthreads();
-	{
-		f32 A = InputA;
-		f32 B = __shfl_sync(0xFFFF'FFFF, InputB, 0);
-		Result = A * B;
+	u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	for (u32 j = 0; j < LengthB; ++j) {
+		if (i + j >= LengthA) break;
+		f32 RegisterA = A[i + j];
+		f32 RegisterB = B[j];
+		Result = fmaf(RegisterA, RegisterB, Result);
 	}
-	for (u32 i = 1; i < 4; ++i) {
-		f32 A = __shfl_down_sync(0xFFFF'FFFF, InputA, i);
-		f32 B = __shfl_sync(0xFFFF'FFFF, InputB, i);
-		Result = fma(A, B, Result);
-	}
-#endif
-	Out[LocalIndex] = Result;
+
+	Out[i] = Result;
 }
+#elif 0
+// Thread-level
+__global__ void Convolution(f32 *A, u32 LengthA, f32 *B, u32 LengthB, f32 *Out) {
+	u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	f32 RegisterA = A[i];
+	f32 RegisterB = B[i];
+	f32 Result = RegisterA * __shfl_sync(0xFFFFFFFF, RegisterB, 0);
+
+	for (u32 j = 1; j < LengthB; ++j) {
+		f32 ShiftedRegisterA = __shfl_down_sync(0xFFFFFFFF, RegisterA, j);
+		f32 ShiftedRegisterB = __shfl_sync(0xFFFFFFFF, RegisterB, j);
+		if (i + j < LengthA) {
+			Result = fmaf(ShiftRegisterA, ShiftRegisterB, Result);
+		}
+	}
+
+	Out[i] = Result;
+}
+#elif 0
+#define FULL_MASK 0xFFFFFFFF
+__global__ void Convolution(f32 *A, u32 LengthA, f32 *B, u32 LengthB, f32 *Out) {
+	// broken :|
+
+	u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+	u32 LaneIndex = threadIdx.x % 32;
+
+	f32 Result = 0.0f;
+	for (u32 j = 0; j < LengthB; j += 32) {
+
+		f32 RegisterB = A[j + LaneIndex];
+
+		for (u32 s = 0; s < 32; ++s) {
+			f32 RegisterA = A[i + j + s];
+			f32 ShiftedRegisterB = __shfl_sync(0xFFFFFFFF, RegisterB, s);
+			Result = fmaf(RegisterA, ShiftedRegisterB, Result);
+		}
+	}
+
+	Out[i] = Result;
+}
+#else
+__global__ void Convolution(f32 *A, u32 LengthA, f32 *B, u32 LengthB, f32 *Out) {
+
+	f32 Result = 0.0f;
+	u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+	u32 LaneIndex = threadIdx.x % 32;
+
+	__shared__ f32 SharedB[32];
+
+	for (u32 j = 0; j < LengthB; j += 32) {
+		SharedB[LaneIndex] = B[j + LaneIndex];
+		__syncthreads();
+		for (u32 s = 0; s < 32; ++s) {
+			if (i + j + s >= LengthA) break;
+			f32 RegisterA = A[i + j + s]; 
+			Result = fmaf(RegisterA, SharedB[s], Result);
+		}
+		__syncthreads();
+	}
+
+	Out[i] = Result;
+}
+#endif
 
 s32 main() {
-	InitRandomIntegers();
-	puts("===");
+	Init();
 
 	f32 *GPUArray1 = 0, *GPUArray2 = 0, *GPUArray3 = 0;
-	cudaMalloc(&GPUArray1, sizeof(InitialArray1));
-	cudaMalloc(&GPUArray2, sizeof(InitialArray2));
-	cudaMalloc(&GPUArray3, sizeof(ResultArray));
-	cudaMemset(GPUArray3, 0, sizeof(f32));
-	cudaMemcpy(GPUArray1, InitialArray1, sizeof(InitialArray1), cudaMemcpyHostToDevice);
-	cudaMemcpy(GPUArray2, InitialArray2, sizeof(InitialArray2), cudaMemcpyHostToDevice);
+	cudaMalloc(&GPUArray1, sizeof(ArrayA));
+	cudaMalloc(&GPUArray2, sizeof(ArrayB));
+	cudaMalloc(&GPUArray3, sizeof(ArrayA));
+	cudaMemset(GPUArray3, 0, sizeof(ArrayA));
+	cudaMemcpy(GPUArray1, ArrayA, sizeof(ArrayA), cudaMemcpyHostToDevice);
+	cudaMemcpy(GPUArray2, ArrayB, sizeof(ArrayB), cudaMemcpyHostToDevice);
 
-	dim3 threadDimension(ARRAY_SIZE, 1);
-	dim3 blockDimension(1, 1);
-	Dot<<<blockDimension, threadDimension>>>(GPUArray1, GPUArray2, GPUArray3, ARRAY_SIZE);
+	u32 ThreadCount = SIZE_A;
+	u32 BlockCount = 1;
+
+	Convolution<<<BlockCount, ThreadCount>>>(GPUArray1, SIZE_A, GPUArray2, SIZE_B, GPUArray3);
 	cudaMemcpy(ResultArray, GPUArray3, sizeof(ResultArray), cudaMemcpyDeviceToHost);
 
-	puts("===");
-
 #if 1
-	for (u32 i = 0; i < ARRAY_SIZE; i += 1) {
+	for (u32 i = 0; i < SIZE_A; i += 1) {
 		f32 ExpectedResult = 0.0f;
-		for (u32 j = 0; j < ARRAY_LEN(InitialArray2); ++j) {
-			if (i + j > ARRAY_SIZE) break;
-			ExpectedResult += InitialArray2[j] * InitialArray1[i + j];
+		for (u32 j = 0; j < SIZE_B; ++j) {
+			if (i + j >= SIZE_A) break;
+			ExpectedResult += ArrayB[j] * ArrayA[j + i];
+		}
+		if (i % 32 == 0) {
+			printf(ANSI_COLOR_RESET "Warp %d\n", i / 32);
 		}
 		f32 ActualResult = ResultArray[i];
-		printf("Expected: %.2f -- Actual: %.2f\n", ExpectedResult, ActualResult);
+		if (ExpectedResult == ActualResult) {
+			printf(ANSI_COLOR_GREEN "Expected: %.2f == Actual: %.2f\n", ExpectedResult, ActualResult);
+		} else {
+			printf(ANSI_COLOR_RED "Expected: %.2f != Actual: %.2f\n", ExpectedResult, ActualResult);
+		}
 	}
 #endif
 	printf(ANSI_COLOR_RESET);
