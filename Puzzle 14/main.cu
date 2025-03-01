@@ -1,44 +1,116 @@
 #include "..\base.h"
 
 #include <stdio.h>
+#include <assert.h>
 
 static random_state RandomState = { 0xB40148552A2E3491 };
-#define MATRIX_SIZE 4
+
+#define MATRIX_SIZE 32
+
 static f32 MatrixA[MATRIX_SIZE * MATRIX_SIZE] = {0};
 static f32 MatrixB[MATRIX_SIZE * MATRIX_SIZE] = {0};
 static f32 MatrixOut[MATRIX_SIZE * MATRIX_SIZE] = {0};
 
 static void Init() {
 	for (u32 i = 0; i < MATRIX_SIZE * MATRIX_SIZE; ++i) {
-		MatrixA[i] = (f32)(RandomInt(&RandomState) % 32) / 32.0f;
-		MatrixB[i] = (f32)(RandomInt(&RandomState) % 32) / 32.0f;
+		MatrixA[i] = (f32)(RandomInt(&RandomState) % 128) / 128.0f;
+		MatrixB[i] = (f32)(RandomInt(&RandomState) % 128) / 128.0f;
+		// MatrixA[i] = i;
+		// MatrixB[i] = i;
 	}
 }
 
-__global__ void MatrixMultiply(f32 *InA, f32 *InB, f32 *Out) {
-#if 0
-	// Reference
-	u32 Column = threadIdx.x % MATRIX_SIZE;
-	u32 Row = threadIdx.x / MATRIX_SIZE;
-	f32 Result = 0.0f;
-	for (u32 i = 0; i < MATRIX_SIZE; ++i) {
-		Result = fma(InA[Row * MATRIX_SIZE + i], InB[i * MATRIX_SIZE + Column], Result);
+__global__ void MatrixMultiply1(f32 *InA, f32 *InB, f32 *Out) {
+	const u32 X = blockIdx.x * blockDim.x + threadIdx.x;
+	const u32 Y = blockIdx.y * blockDim.y + threadIdx.y;
+	if (X < MATRIX_SIZE && Y < MATRIX_SIZE) {
+		float Result = 0.0f;
+		for (u32 i = 0; i < MATRIX_SIZE; ++i) {
+			f32 A = InA[Y * MATRIX_SIZE + i];
+			f32 B = InB[i * MATRIX_SIZE + X];
+			Result = fma(A, B, Result);
+		}
+		Out[Y * MATRIX_SIZE + X] = Result;
 	}
-	Out[threadIdx.x] = Result;
-#elif 1
-	// 4x4 Special Case
-	u32 Column = threadIdx.x % 4;
-	u32 Row = threadIdx.x / 4;
-	f32 ValueA = InA[threadIdx.x];
-	f32 ValueB = InB[threadIdx.x];
+}
 
-	f32 Result = 0.0f;
-	Result = fma(__shfl_sync(0xFFFF, ValueA, Row * 4 + 0), __shfl_sync(0xFFFF, ValueB, 0 * 4 + Column), Result);
-	Result = fma(__shfl_sync(0xFFFF, ValueA, Row * 4 + 1), __shfl_sync(0xFFFF, ValueB, 1 * 4 + Column), Result);
-	Result = fma(__shfl_sync(0xFFFF, ValueA, Row * 4 + 2), __shfl_sync(0xFFFF, ValueB, 2 * 4 + Column), Result);
-	Result = fma(__shfl_sync(0xFFFF, ValueA, Row * 4 + 3), __shfl_sync(0xFFFF, ValueB, 3 * 4 + Column), Result);
-	Out[threadIdx.x] = Result;
-#endif
+__global__ void MatrixMultiply3(f32 *InA, f32 *InB, f32 *Out) {
+	const u32 BlockSize = 16;
+	const u32 Row = blockIdx.y * BlockSize;
+	const u32 Column = blockIdx.x * BlockSize;
+	const u32 ThreadRow = threadIdx.y;
+	const u32 ThreadColumn = threadIdx.x;
+
+	__shared__ f32 As[BlockSize * BlockSize];
+	__shared__ f32 Bs[BlockSize * BlockSize];
+
+	InA += Row * MATRIX_SIZE;
+	InB += Column;
+	Out += Row * MATRIX_SIZE + Column;
+
+	float Result = 0.0f;
+
+	for (u32 Index = 0; Index < MATRIX_SIZE; Index += BlockSize) {
+		As[ThreadRow * BlockSize + ThreadColumn] = InA[ThreadRow * MATRIX_SIZE + ThreadColumn];
+		Bs[ThreadRow * BlockSize + ThreadColumn] = InB[ThreadRow * MATRIX_SIZE + ThreadColumn];
+
+		__syncthreads();
+
+		InA += BlockSize;
+		InB += BlockSize * MATRIX_SIZE;
+
+		for (u32 DotIndex = 0; DotIndex < BlockSize; ++DotIndex) {
+			f32 A = As[ThreadRow * BlockSize + DotIndex];
+			f32 B = Bs[DotIndex * BlockSize + ThreadColumn];
+			Result = fma(A, B, Result);
+		}
+		__syncthreads();
+	}
+
+	Out[ThreadRow * MATRIX_SIZE + ThreadColumn] = Result;
+}
+__global__ void MatrixMultiply4(f32 *A, f32 *B, f32 *Out) {
+
+	const u32 TileSize = 32;
+	const u32 NumResultsPerThread = 32;
+	__shared__ f32 SharedA[TileSize][TileSize];
+	__shared__ f32 SharedB[TileSize][TileSize];
+
+	u32 Row = blockIdx.y * TileSize + threadIdx.y * NumResultsPerThread;
+	u32 Column = blockIdx.x * TileSize + threadIdx.x;
+
+	f32 Sum[NumResultsPerThread] = {0};
+
+	for (u32 Tile = 0; Tile < MATRIX_SIZE / TileSize; ++Tile) {
+		for (u32 i = 0; i < NumResultsPerThread; ++i) {
+			u32 RowIndex = Row + i;
+			if (RowIndex < MATRIX_SIZE) {
+				SharedA[threadIdx.y * NumResultsPerThread + i][threadIdx.x] = A[RowIndex * MATRIX_SIZE + (Tile * TileSize + threadIdx.x)];
+			}
+		}
+
+		SharedB[threadIdx.y][threadIdx.x] = B[(Tile * TileSize + threadIdx.y) * MATRIX_SIZE + Column];
+		__syncthreads();
+
+		for (u32 k = 0; k < TileSize; ++k) {
+			for (u32 i = 0; i < NumResultsPerThread; ++i) {
+				u32 RowIndex = Row + i;
+				if (RowIndex < MATRIX_SIZE) {
+					f32 Multiplicand = SharedA[i][k];
+					f32 Multiplier = SharedB[k][threadIdx.x];
+					Sum[i] += Multiplicand * Multiplier;
+				}
+			}
+		}
+		__syncthreads();
+	}
+
+	for (u32 i = 0; i < NumResultsPerThread; ++i) {
+		u32 RowIndex = Row + i;
+		if (RowIndex < MATRIX_SIZE) {
+			Out[RowIndex * MATRIX_SIZE + Column] = Sum[i];
+		}
+	}
 }
 
 s32 main() {
@@ -52,9 +124,9 @@ s32 main() {
 	cudaMemcpy(GPUArray2, MatrixB, sizeof(MatrixB), cudaMemcpyHostToDevice);
 	cudaMemset(GPUArray3, 0, sizeof(MatrixOut));
 
-	dim3 threadDimension(MATRIX_SIZE * MATRIX_SIZE, 1);
-	dim3 blockDimension(1, 1);
-	MatrixMultiply<<<blockDimension, threadDimension>>>(GPUArray1, GPUArray2, GPUArray3);
+	dim3 blockDimension(32, 32);
+	dim3 gridDimension((MATRIX_SIZE + 31) / 32, (MATRIX_SIZE + 31) / 32);
+	MatrixMultiply5<<<gridDimension, blockDimension>>>(GPUArray1, GPUArray2, GPUArray3);
 	cudaMemcpy(MatrixOut, GPUArray3, sizeof(MatrixOut), cudaMemcpyDeviceToHost);
 
 #if 1
@@ -72,7 +144,6 @@ s32 main() {
 		} else {
 			printf(ANSI_COLOR_RED "Expected: %.2f -- Actual: %.2f at Index: %u\n", ExpectedResult, ActualResult, i);
 			FoundError = true;
-			// break;
 		}
 	}
 	if (!FoundError) {

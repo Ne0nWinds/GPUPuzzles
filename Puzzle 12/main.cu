@@ -5,7 +5,6 @@
 #define THREADS_PER_BLOCK 256
 
 static f32 InitialArray[1024 * 32] = {0};
-static f32 Result = 0.0f;
 
 static void Init() {
 	random_state RandomState = { 0xB40148552A2E3491ULL };
@@ -53,17 +52,20 @@ __global__ void PrefixSum(f32 *A, f32 *Out) {
 s32 main() {
 	Init();
 
-	f32 *GPUArrayA = 0, *GPUArrayB = 0, *GPUArrayOut = 0;
+	const u32 BlockCount = ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK;
+
+	f32 *GPUArrayA = 0, *IntermediaryResults = 0, *GPUFinalResult = 0;
 	cudaMalloc(&GPUArrayA, sizeof(InitialArray));
-	cudaMalloc(&GPUArrayB, ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK);
-	cudaMemset(GPUArrayB, 0, ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK);
-	cudaMalloc(&GPUArrayOut, sizeof(f32));
+	cudaMalloc(&IntermediaryResults, BlockCount * sizeof(f32));
+	cudaMemset(IntermediaryResults, 0, ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK);
+	cudaMalloc(&GPUFinalResult, sizeof(f32));
 	cudaMemcpy(GPUArrayA, InitialArray, sizeof(InitialArray), cudaMemcpyHostToDevice);
 
-	u32 BlockCount = ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK;
-	PrefixSum<<<BlockCount, THREADS_PER_BLOCK>>>(GPUArrayA, GPUArrayB);
-	PrefixSum<<<1, BlockCount>>>(GPUArrayB, GPUArrayOut);
-	cudaMemcpy(&Result, GPUArrayOut, sizeof(Result), cudaMemcpyDeviceToHost);
+	PrefixSum<<<BlockCount, THREADS_PER_BLOCK>>>(GPUArrayA, IntermediaryResults);
+	PrefixSum<<<1, BlockCount>>>(IntermediaryResults, GPUFinalResult);
+
+	f32 Result = 0.0f;
+	cudaMemcpy(&Result, GPUFinalResult, sizeof(f32), cudaMemcpyDeviceToHost);
 
 	f32 ExpectedResult = 0.0f;
 	for (u32 i = 0; i < ARRAY_LEN(InitialArray); ++i) {
