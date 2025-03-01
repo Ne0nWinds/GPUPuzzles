@@ -24,47 +24,29 @@ __global__ void Dot(f32 *A, f32 *B, f32 *Out) {
 		*Out = ReducedSum;
 	}
 }
-#elif 0
-#define ARRAY_SIZE 1024
-// Block-level dot product
-__global__ void Dot(f32 *A, f32 *B, f32 *Out) {
-
-	__shared__ f32 WarpLevelResults[32];
-
-	f32 ElementwiseProduct = A[threadIdx.x] * B[threadIdx.x];
-	f32 ReducedSum = ReduceAdd(ElementwiseProduct);
-
-	u32 WarpIndex = threadIdx.x / 32;
-	if (threadIdx.x % 32 == 0) {
-		WarpLevelResults[WarpIndex] = ReducedSum;
-	}
-	__syncthreads();
-
-	if (WarpIndex == 0) {
-		f32 Result = WarpLevelResults[threadIdx.x];
-		Result = ReduceAdd(Result);
-		if (threadIdx.x == 0) {
-			*Out = Result;
-		}
-	}
-}
 #else
 #define ARRAY_SIZE 2048
 // Global dot product
 __global__ void Dot(f32 *A, f32 *B, f32 *Out) {
 
-	__shared__ f32 WarpDotProductResults[32];
+	__shared__ f32 WarpLevelResults[32];
 
 	u32 GlobalIndex = blockIdx.x * blockDim.x + threadIdx.x;
 	f32 ElementwiseProduct = A[GlobalIndex] * B[GlobalIndex];
 	f32 ReducedSum = ReduceAdd(ElementwiseProduct);
 
 	u32 WarpIndex = threadIdx.x / 32;
-	WarpDotProductResults[WarpIndex] = ReducedSum;
+	u32 WarpCount = blockDim.x / 32;
+	if (threadIdx.x % 32 == 0 && WarpIndex < WarpCount) {
+		WarpLevelResults[WarpIndex] = ReducedSum;
+	}
 	__syncthreads();
 
 	if (WarpIndex == 0) {
-		f32 Result = WarpDotProductResults[threadIdx.x];
+		f32 Result = 0.0f;
+		if (threadIdx.x < WarpCount) {
+			Result = WarpLevelResults[threadIdx.x];
+		}
 		Result = ReduceAdd(Result);
 		if (threadIdx.x == 0) {
 			atomicAdd(Out, Result);

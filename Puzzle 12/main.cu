@@ -2,65 +2,79 @@
 
 #include <stdio.h>
 
-static random_state RandomState = { 0xB40148552A2E3491 };
-#define THREAD_SIZE 256
-#define ARRAY_SIZE 0x7FFFF00
-static f32 InitialArray[ARRAY_SIZE] = {0};
-static f32 ResultArray[ARRAY_SIZE / 32] = {0};
+#define THREADS_PER_BLOCK 256
 
-static void InitRandomIntegers() {
-	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
-		InitialArray[i] = RandomInt(&RandomState) % 32;
+static f32 InitialArray[1024 * 32] = {0};
+static f32 Result = 0.0f;
+
+static void Init() {
+	random_state RandomState = { 0xB40148552A2E3491ULL };
+	for (u32 i = 0; i < ARRAY_LEN(InitialArray); ++i) {
+		InitialArray[i] = RandomFloat(&RandomState);
 	}
 }
 
-__global__ void HorizontalAdd(f32 *In, f32 *Out) {
-	u32 Index = threadIdx.x + blockIdx.x * THREAD_SIZE;
+__device__ f32 ReduceAdd(f32 Value) {
+	u32 Mask = 0xFFFFFFFF;
+	Value += __shfl_down_sync(Mask, Value, 16);
+	Value += __shfl_down_sync(Mask, Value, 8);
+	Value += __shfl_down_sync(Mask, Value, 4);
+	Value += __shfl_down_sync(Mask, Value, 2);
+	Value += __shfl_down_sync(Mask, Value, 1);
+	return Value;
+}
 
-	f32 Result = In[Index];
+__global__ void PrefixSum(f32 *A, f32 *Out) {
 
-	for (u32 Shift = 16; Shift > 0; Shift /= 2) {
-		Result += __shfl_down_sync(0xFFFF'FFFF, Result, Shift);
+	__shared__ f32 SharedSums[32];
+
+	u32 GlobalIndex = blockIdx.x * blockDim.x + threadIdx.x;
+	f32 ReducedSum = ReduceAdd(A[GlobalIndex]);
+
+	u32 WarpIndex = threadIdx.x / 32;
+	u32 WarpCount = blockDim.x / 32;
+	if (threadIdx.x % 32 == 0 && WarpIndex < WarpCount) {
+		SharedSums[WarpIndex] = ReducedSum;
 	}
-	if ((threadIdx.x & (32 - 1)) == 0) {
-		u32 OutIndex = threadIdx.x / 32 + blockIdx.x * (THREAD_SIZE / 32);
-		Out[OutIndex] = Result;
+	__syncthreads();
+
+	if (WarpIndex == 0) {
+		f32 Result = 0.0f;
+		if (threadIdx.x < WarpCount) {
+			Result = SharedSums[threadIdx.x];
+		}
+		Result = ReduceAdd(Result);
+		if (threadIdx.x == 0) {
+			Out[blockIdx.x] = Result;
+		}
 	}
 }
 
 s32 main() {
-	InitRandomIntegers();
+	Init();
 
-	f32 *GPUArray1 = 0, *GPUArray2 = 0;
-	cudaMalloc(&GPUArray1, sizeof(InitialArray));
-	cudaMalloc(&GPUArray2, sizeof(ResultArray));
-	cudaMemcpy(GPUArray1, InitialArray, sizeof(InitialArray), cudaMemcpyHostToDevice);
+	f32 *GPUArrayA = 0, *GPUArrayB = 0, *GPUArrayOut = 0;
+	cudaMalloc(&GPUArrayA, sizeof(InitialArray));
+	cudaMalloc(&GPUArrayB, ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK);
+	cudaMemset(GPUArrayB, 0, ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK);
+	cudaMalloc(&GPUArrayOut, sizeof(f32));
+	cudaMemcpy(GPUArrayA, InitialArray, sizeof(InitialArray), cudaMemcpyHostToDevice);
 
-	dim3 threadDimension(THREAD_SIZE, 1);
-	dim3 blockDimension(ARRAY_SIZE / THREAD_SIZE, 1);
-	HorizontalAdd<<<blockDimension, threadDimension>>>(GPUArray1, GPUArray2);
-	cudaMemcpy(ResultArray, GPUArray2, sizeof(ResultArray), cudaMemcpyDeviceToHost);
+	u32 BlockCount = ARRAY_LEN(InitialArray) / THREADS_PER_BLOCK;
+	PrefixSum<<<BlockCount, THREADS_PER_BLOCK>>>(GPUArrayA, GPUArrayB);
+	PrefixSum<<<1, BlockCount>>>(GPUArrayB, GPUArrayOut);
+	cudaMemcpy(&Result, GPUArrayOut, sizeof(Result), cudaMemcpyDeviceToHost);
 
-#if 0
-	bool FoundError = false;
-	for (u32 i = 0; i < ARRAY_SIZE; i += 32) {
-		f32 ExpectedResult = 0.0f;
-		for (u32 j = 0; j < 32; ++j) {
-			ExpectedResult += InitialArray[i + j];
-		}
-		f32 ActualResult = ResultArray[i / 32];
-		if (ExpectedResult == ActualResult) {
-			// printf(ANSI_COLOR_GREEN "Expected: %.2f -- Actual: %.2f\n", ExpectedResult, ActualResult);
-		} else {
-			printf(ANSI_COLOR_RED "Expected: %.2f -- Actual: %.2f at Index: %u\n", ExpectedResult, ActualResult, i / 32);
-			printf("");
-			FoundError = true;
-			break;
-		}
+	f32 ExpectedResult = 0.0f;
+	for (u32 i = 0; i < ARRAY_LEN(InitialArray); ++i) {
+		ExpectedResult += InitialArray[i];
 	}
-	if (!FoundError) {
-		puts(ANSI_COLOR_GREEN "Test Passed!");
+
+	if (Result == ExpectedResult) {
+		printf(ANSI_COLOR_GREEN "Expected: %.5f | Actual: %.5f\n", ExpectedResult, Result);
+	} else {
+		printf(ANSI_COLOR_RED "Expected: %.5f | Actual: %.5f\n", ExpectedResult, Result);
 	}
-#endif
+
 	printf(ANSI_COLOR_RESET);
 }
