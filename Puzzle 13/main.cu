@@ -8,17 +8,27 @@
 static f32 InitialArray[ARRAY_SIZE] = {0};
 static f32 ResultArray[ROW_SIZE] = {0};
 
-static void Init() {
+static constexpr void Init() {
 	random_state RandomState = { 0xB40148552A2E3491ULL };
 	for (u32 i = 0; i < ARRAY_SIZE; ++i) {
 		InitialArray[i] = RandomFloat(&RandomState) * 2.0f - 1.0f;
 	}
 }
 
+__device__ f32 ReduceAdd(f32 Value) {
+	u32 Mask = 0xFFFFFFFF;
+	Value += __shfl_down_sync(Mask, Value, 16);
+	Value += __shfl_down_sync(Mask, Value, 8);
+	Value += __shfl_down_sync(Mask, Value, 4);
+	Value += __shfl_down_sync(Mask, Value, 2);
+	Value += __shfl_down_sync(Mask, Value, 1);
+	return Value;
+}
+
 #if 0
 __global__ void AxisSum(f32 *In, uint2 ArrayDimensions, f32 *Out) {
-	u32 X = blockIdx.x * blockDim.x + threadIdx.x;
-	u32 Y = blockIdx.y * blockDim.y + threadIdx.y;
+	u32 X = threadIdx.x;
+	u32 Y = threadIdx.y;
 
 	f32 Result = 0.0f;
 	for (u32 OffsetY = 0; OffsetY < ArrayDimensions.y; OffsetY += 1) {
@@ -27,29 +37,46 @@ __global__ void AxisSum(f32 *In, uint2 ArrayDimensions, f32 *Out) {
 	}
 	Out[threadIdx.x] = Result;
 }
-#else
+#elif 0
 __global__ void AxisSum(f32 *In, uint2 ArrayDimensions, f32 *Out) {
-
-	__shared__ f32 SharedValues[1024];
-
-	u32 X = blockIdx.x * blockDim.x + threadIdx.x;
-	u32 Y = blockIdx.y * blockDim.y + threadIdx.y;
 
 	f32 Result = 0.0f;
 	for (u32 OffsetY = 0; OffsetY < ArrayDimensions.y; OffsetY += 32) {
-		u32 GlobalIndex = (Y + OffsetY) * ArrayDimensions.x + X;
+		u32 GlobalIndex = (threadIdx.y + OffsetY) * ArrayDimensions.x + threadIdx.x;
 		Result += In[GlobalIndex];
 	}
 
-	SharedValues[threadIdx.y * 32 + threadIdx.x] = Result;
+	__shared__ f32 SharedValues[32][32];
+	SharedValues[threadIdx.y][threadIdx.x] = Result;
 	__syncthreads();
 
 	if (threadIdx.x < 32 && threadIdx.y == 0) {
 		f32 FinalResult = 0.0f;
-		for (u32 OffsetY = 0; OffsetY < 1024; OffsetY += 32) {
-			FinalResult += SharedValues[OffsetY + threadIdx.x];
+		for (u32 OffsetY = 0; OffsetY < 32; OffsetY += 1) {
+			FinalResult += SharedValues[OffsetY][threadIdx.x];
 		}
 		Out[threadIdx.x] = FinalResult;
+	}
+}
+#else
+__global__ void AxisSum(f32 *In, uint2 ArrayDimensions, f32 *Out) {
+
+	f32 Result = 0.0f;
+	for (u32 OffsetY = 0; OffsetY < ArrayDimensions.y; OffsetY += 32) {
+		u32 GlobalY = threadIdx.y + OffsetY;
+		u32 GlobalX = blockIdx.x * 32 + threadIdx.x;
+		u32 GlobalIndex = GlobalY * ArrayDimensions.x + GlobalX;
+		Result += In[GlobalIndex];
+	}
+
+	__shared__ f32 SharedValues[32][32];
+	SharedValues[threadIdx.x][threadIdx.y] = Result;
+	__syncthreads();
+
+	f32 SharedValue = SharedValues[threadIdx.y][threadIdx.x];
+	f32 FinalResult = ReduceAdd(SharedValue);
+	if (threadIdx.x % 32 == 0) {
+		Out[blockIdx.x * 32 + threadIdx.y] = FinalResult;
 	}
 }
 #endif
@@ -63,8 +90,8 @@ s32 main() {
 	cudaMemcpy(GPUArray1, InitialArray, sizeof(InitialArray), cudaMemcpyHostToDevice);
 
 	dim3 ThreadDimensions(32, 32);
-	AxisSum<<<1, ThreadDimensions>>>(GPUArray1, make_uint2(ROW_SIZE, COLUMN_SIZE), GPUArray2);
-	// AxisSum<<<1, 32>>>(GPUArray1, make_uint2(ROW_SIZE, COLUMN_SIZE), GPUArray2);
+	AxisSum<<<ROW_SIZE / 32, ThreadDimensions>>>(GPUArray1, make_uint2(ROW_SIZE, COLUMN_SIZE), GPUArray2);
+	// AxisSum<<<1, ROW_SIZE>>>(GPUArray1, make_uint2(ROW_SIZE, COLUMN_SIZE), GPUArray2);
 	cudaMemcpy(ResultArray, GPUArray2, sizeof(ResultArray), cudaMemcpyDeviceToHost);
 
 #if 1

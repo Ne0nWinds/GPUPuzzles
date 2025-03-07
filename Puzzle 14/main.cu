@@ -5,113 +5,71 @@
 
 static random_state RandomState = { 0xB40148552A2E3491 };
 
-#define MATRIX_SIZE 32
+__device__ f32 ReduceAdd(f32 Value) {
+	u32 Mask = 0xFFFFFFFF;
+	Value += __shfl_down_sync(Mask, Value, 16);
+	Value += __shfl_down_sync(Mask, Value, 8);
+	Value += __shfl_down_sync(Mask, Value, 4);
+	Value += __shfl_down_sync(Mask, Value, 2);
+	Value += __shfl_down_sync(Mask, Value, 1);
+	return Value;
+}
+
+#define MATRIX_SIZE 2048
 
 static f32 MatrixA[MATRIX_SIZE * MATRIX_SIZE] = {0};
 static f32 MatrixB[MATRIX_SIZE * MATRIX_SIZE] = {0};
 static f32 MatrixOut[MATRIX_SIZE * MATRIX_SIZE] = {0};
 
-static void Init() {
+static constexpr void Init() {
 	for (u32 i = 0; i < MATRIX_SIZE * MATRIX_SIZE; ++i) {
-		MatrixA[i] = (f32)(RandomInt(&RandomState) % 128) / 128.0f;
-		MatrixB[i] = (f32)(RandomInt(&RandomState) % 128) / 128.0f;
+		MatrixA[i] = RandomFloat(&RandomState);
+		MatrixB[i] = RandomFloat(&RandomState);
 		// MatrixA[i] = i;
 		// MatrixB[i] = i;
 	}
 }
 
-__global__ void MatrixMultiply1(f32 *InA, f32 *InB, f32 *Out) {
-	const u32 X = blockIdx.x * blockDim.x + threadIdx.x;
-	const u32 Y = blockIdx.y * blockDim.y + threadIdx.y;
-	if (X < MATRIX_SIZE && Y < MATRIX_SIZE) {
-		float Result = 0.0f;
-		for (u32 i = 0; i < MATRIX_SIZE; ++i) {
-			f32 A = InA[Y * MATRIX_SIZE + i];
-			f32 B = InB[i * MATRIX_SIZE + X];
-			Result = fma(A, B, Result);
-		}
-		Out[Y * MATRIX_SIZE + X] = Result;
-	}
-}
-
-__global__ void MatrixMultiply3(f32 *InA, f32 *InB, f32 *Out) {
+#if 0
+__global__ void MatrixMultiply(f32 *InA, f32 *InB, u32 MatrixSize, f32 *Out) {
 	const u32 BlockSize = 16;
-	const u32 Row = blockIdx.y * BlockSize;
-	const u32 Column = blockIdx.x * BlockSize;
-	const u32 ThreadRow = threadIdx.y;
-	const u32 ThreadColumn = threadIdx.x;
-
-	__shared__ f32 As[BlockSize * BlockSize];
-	__shared__ f32 Bs[BlockSize * BlockSize];
-
-	InA += Row * MATRIX_SIZE;
-	InB += Column;
-	Out += Row * MATRIX_SIZE + Column;
+	const u32 X = blockIdx.x * BlockSize + threadIdx.x;
+	const u32 Y = blockIdx.y * BlockSize + threadIdx.y;
 
 	float Result = 0.0f;
+	for (u32 I = 0; I < MatrixSize; ++I) {
+		f32 A = InA[Y * MatrixSize + I];
+		f32 B = InB[I * MatrixSize + X];
+		Result = fma(A, B, Result);
+	}
+	Out[Y * MATRIX_SIZE + X] = Result;
+}
+#else
+__global__ void MatrixMultiply(f32 *InA, f32 *InB, u32 MatrixSize, f32 *Out) {
+	const u32 X = blockIdx.x * 16 + threadIdx.x;
+	const u32 Y = blockIdx.y * 16 + threadIdx.y;
 
-	for (u32 Index = 0; Index < MATRIX_SIZE; Index += BlockSize) {
-		As[ThreadRow * BlockSize + ThreadColumn] = InA[ThreadRow * MATRIX_SIZE + ThreadColumn];
-		Bs[ThreadRow * BlockSize + ThreadColumn] = InB[ThreadRow * MATRIX_SIZE + ThreadColumn];
+	__shared__ f32 SharedMemoryA[16][16];
+	__shared__ f32 SharedMemoryB[16][16];
 
+	f32 Result = 0.0f;
+	for (u32 Offset = 0; Offset < MatrixSize; Offset += 16) {
+		SharedMemoryA[threadIdx.y][threadIdx.x] = InA[Y * MatrixSize + (Offset + threadIdx.x)];
+		SharedMemoryB[threadIdx.y][threadIdx.x] = InB[(Offset + threadIdx.y) * MatrixSize + X];
 		__syncthreads();
 
-		InA += BlockSize;
-		InB += BlockSize * MATRIX_SIZE;
-
-		for (u32 DotIndex = 0; DotIndex < BlockSize; ++DotIndex) {
-			f32 A = As[ThreadRow * BlockSize + DotIndex];
-			f32 B = Bs[DotIndex * BlockSize + ThreadColumn];
+		#pragma unroll
+		for (u32 I = 0; I < 16; ++I) {
+			f32 A = SharedMemoryA[threadIdx.y][I];
+			f32 B = SharedMemoryB[I][threadIdx.x];
 			Result = fma(A, B, Result);
 		}
 		__syncthreads();
 	}
 
-	Out[ThreadRow * MATRIX_SIZE + ThreadColumn] = Result;
+	Out[Y * MATRIX_SIZE + X] = Result;
 }
-__global__ void MatrixMultiply4(f32 *A, f32 *B, f32 *Out) {
-
-	const u32 TileSize = 32;
-	const u32 NumResultsPerThread = 32;
-	__shared__ f32 SharedA[TileSize][TileSize];
-	__shared__ f32 SharedB[TileSize][TileSize];
-
-	u32 Row = blockIdx.y * TileSize + threadIdx.y * NumResultsPerThread;
-	u32 Column = blockIdx.x * TileSize + threadIdx.x;
-
-	f32 Sum[NumResultsPerThread] = {0};
-
-	for (u32 Tile = 0; Tile < MATRIX_SIZE / TileSize; ++Tile) {
-		for (u32 i = 0; i < NumResultsPerThread; ++i) {
-			u32 RowIndex = Row + i;
-			if (RowIndex < MATRIX_SIZE) {
-				SharedA[threadIdx.y * NumResultsPerThread + i][threadIdx.x] = A[RowIndex * MATRIX_SIZE + (Tile * TileSize + threadIdx.x)];
-			}
-		}
-
-		SharedB[threadIdx.y][threadIdx.x] = B[(Tile * TileSize + threadIdx.y) * MATRIX_SIZE + Column];
-		__syncthreads();
-
-		for (u32 k = 0; k < TileSize; ++k) {
-			for (u32 i = 0; i < NumResultsPerThread; ++i) {
-				u32 RowIndex = Row + i;
-				if (RowIndex < MATRIX_SIZE) {
-					f32 Multiplicand = SharedA[i][k];
-					f32 Multiplier = SharedB[k][threadIdx.x];
-					Sum[i] += Multiplicand * Multiplier;
-				}
-			}
-		}
-		__syncthreads();
-	}
-
-	for (u32 i = 0; i < NumResultsPerThread; ++i) {
-		u32 RowIndex = Row + i;
-		if (RowIndex < MATRIX_SIZE) {
-			Out[RowIndex * MATRIX_SIZE + Column] = Sum[i];
-		}
-	}
-}
+#endif
 
 s32 main() {
 	Init();
@@ -124,12 +82,11 @@ s32 main() {
 	cudaMemcpy(GPUArray2, MatrixB, sizeof(MatrixB), cudaMemcpyHostToDevice);
 	cudaMemset(GPUArray3, 0, sizeof(MatrixOut));
 
-	dim3 blockDimension(32, 32);
-	dim3 gridDimension((MATRIX_SIZE + 31) / 32, (MATRIX_SIZE + 31) / 32);
-	MatrixMultiply5<<<gridDimension, blockDimension>>>(GPUArray1, GPUArray2, GPUArray3);
+	dim3 GridDimension((MATRIX_SIZE + 15) / 16, (MATRIX_SIZE + 15) / 16);
+	MatrixMultiply<<<GridDimension, dim3(16, 16)>>>(GPUArray1, GPUArray2, MATRIX_SIZE, GPUArray3);
 	cudaMemcpy(MatrixOut, GPUArray3, sizeof(MatrixOut), cudaMemcpyDeviceToHost);
 
-#if 1
+#if 0
 	bool FoundError = false;
 	for (u32 i = 0; i < MATRIX_SIZE * MATRIX_SIZE; i += 1) {
 		f32 ExpectedResult = 0.0f;
@@ -140,10 +97,11 @@ s32 main() {
 		}
 		f32 ActualResult = MatrixOut[i];
 		if (ExpectedResult == ActualResult) {
-			printf(ANSI_COLOR_GREEN "Expected: %.2f -- Actual: %.2f\n", ExpectedResult, ActualResult);
+			// printf(ANSI_COLOR_GREEN "Expected: %.2f -- Actual: %.2f\n", ExpectedResult, ActualResult);
 		} else {
 			printf(ANSI_COLOR_RED "Expected: %.2f -- Actual: %.2f at Index: %u\n", ExpectedResult, ActualResult, i);
 			FoundError = true;
+			break;
 		}
 	}
 	if (!FoundError) {
