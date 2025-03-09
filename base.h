@@ -17,16 +17,17 @@ typedef struct {
 	u64 Seed;
 } random_state;
 
-static inline u32 RandomInt(random_state *State) {
+static inline constexpr u32 RandomInt(random_state *State) {
 	u64 OldSeed = State->Seed;
 	State->Seed *= 0x4D7D3C53ULL;
 	State->Seed += 0x65C3A6D5ULL;
 	return OldSeed >> 32;
 }
 
-static inline f32 RandomFloat(random_state *State) {
-	f32 Int = RandomInt(State) % 32;
-	f32 Result = Int / 32.0f;
+static inline constexpr f32 RandomFloat(random_state *State) {
+	u32 Int = RandomInt(State);
+	f32 Result = (Int >> 26) / 64.0f;
+	Result *= ((Int >> 16) & 0xFF) > 127 ? -1.0 : 1.0;
 	return Result;
 }
 
